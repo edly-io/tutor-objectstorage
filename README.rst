@@ -27,18 +27,19 @@ reimplements equivalent functionality so this plugin can be a complete,
 standalone choice, but that project continues to exist on its own and is not
 replaced or depended upon by this one.
 
-.. warning::
+
 
    **The ``azure`` backend is not safe for production course content yet.**
+
    This plugin's own live conformance suite reproducibly hangs ``rclone serve
-   s3`` — a livelocked process, pinned CPU, zero network progress, no
-   self-recovery — when multipart upload parts arrive out of ascending order,
-   a pattern the S3 API explicitly permits, once the upload crosses roughly
-   300 MiB. Read `EVALUATION.md <EVALUATION.md>`_ before using this backend
-   for anything beyond evaluation. Because of this, selecting
-   ``OBJSTORAGE_BACKEND: azure`` is not enough on its own: you must also set
-   ``OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK: true``, or every ``tutor`` command
-   refuses to run.
+   s3`` when multipart upload parts arrive out of ascending order.
+
+   Read `EVALUATION.md <EVALUATION.md>`_ before using this backend for anything
+   beyond evaluation.
+
+
+
+
 
 How it works
 ------------
