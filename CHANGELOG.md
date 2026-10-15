@@ -4,6 +4,29 @@
 
 ## Unreleased
 
+- [Finding] A second full live-content pass through all three backends -
+  this time through the actual running Open edX application (a real login,
+  a real profile-picture upload, and a real Studio course export/import
+  round trip), not just direct S3-API calls - surfaced a second rclone
+  livelock, independent of the multipart one in `EVALUATION.md` Finding 1:
+  **a single `ListObjects`/`ListObjectsV2` call with a `Delimiter` against a
+  prefix that has zero objects under it hangs the `azure` backend's
+  `rclonegw` gateway indefinitely**, pinning it at 140-165% CPU with no
+  self-recovery. No multipart upload, size threshold, or adversarial client
+  behavior is required - this is the "does this folder exist yet" check
+  `django-storages`' `S3Boto3Storage.listdir()` performs, and it was found
+  through nothing more unusual than exporting a real course containing a
+  SCORM component from Studio's own UI. Confirmed twice, independently
+  (against both the bundled Azurite and an unrelated emulator,
+  [floci-az](https://floci.io/az/)), isolated to a minimal boto3
+  reproduction with no Django/Celery/SCORM involved, and confirmed that a
+  gateway restart alone does not recover it if the original stuck client is
+  still retrying. See `EVALUATION.md` Finding 5 for the full writeup and
+  `TESTING.rst`'s failure-modes table for the updated recovery steps. Not
+  something this plugin's code can fix - the defect is in `rclone serve
+  s3` itself - so, matching this repository's existing practice for
+  Finding 1, this is a documentation update, not a code change.
+
 - [Bugfix] The `tutor` dependency's upper bound was `<22.0.0`, which
   silently downgrades an existing Tutor 22.x install to the newest 21.x
   release on `pip install tutor-objectstorage` - breaking every other

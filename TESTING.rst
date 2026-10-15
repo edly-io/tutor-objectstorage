@@ -359,5 +359,12 @@ Known failure modes
    * - ``rclonegw`` is pinned near 100%+ CPU with no network I/O, and stops
        responding
      - azure
-     - The multipart hang — see ``EVALUATION.md`` Finding 1.
-       ``tutor local restart rclonegw`` clears it; it does not self-recover.
+     - The multipart hang (``EVALUATION.md`` Finding 1) or the empty-prefix
+       listing hang (Finding 5 — far easier to hit: triggered by exporting
+       any course with a SCORM component, or any ``listdir()``/``exists()``
+       check against a path nothing has been written to yet).
+       ``tutor local restart rclonegw`` alone is often **not** enough: if the
+       client that triggered it is still retrying (e.g. a stuck Celery
+       task), it immediately re-triggers the hang against the freshly
+       restarted gateway. Restart the client too (e.g.
+       ``tutor local restart cms-worker lms-worker``).
