@@ -4,6 +4,37 @@
 
 ## Unreleased
 
+- [Bugfix] The `tutor` dependency's upper bound was `<22.0.0`, which
+  silently downgrades an existing Tutor 22.x install to the newest 21.x
+  release on `pip install tutor-objectstorage` - breaking every other
+  installed Tutor plugin's own `tutor<23.0.0,>=22.0.0` constraint in the
+  process, with `pip` only ever surfacing this as a dependency-conflict
+  *warning*, not an install failure. Nothing in this plugin's code actually
+  requires Tutor 21: every command in `TESTING.rst` Tiers 2-4 (`tutor
+  plugins enable`, `config save`, `local do init`, `local start`) was
+  confirmed live against Tutor 22.0.2 with no changes needed. Widened to
+  `<23.0.0`, matching the bound every other current Tutor plugin uses, with
+  a regression test (`test_tutor_dependency_does_not_exclude_current_tutor_releases`)
+  that reads the installed distribution's own dependency metadata, so a
+  future re-narrowing of this bound fails loudly in CI instead of only
+  showing up as a silent downgrade after install.
+
+- [Finding] This plugin had never actually been run before this pass -
+  previous changelog/testing claims describing live verification during
+  development predate any real execution. First genuine end-to-end run,
+  covering all three backends: `external_s3` and `azure` pointed at
+  [floci.io](https://floci.io)'s local AWS S3 and Azure Blob Storage
+  emulators respectively, `rustfs` run locally, all through the real
+  Tutor-rendered Caddy + backend stack (not a hand-rolled stand-in),
+  exercising put/get, multipart upload, presigned URLs, list, copy, delete,
+  and anonymous public/private bucket routing. All three backends passed.
+  One gap surfaced in `floci-az` itself (no `Copy Blob` support, so
+  multipart completion and `CopyObject` fail there) - confirmed as an
+  emulator limitation, not a plugin bug, by reproducing the identical
+  operation successfully against this plugin's own bundled Azurite
+  emulator with zero code changes, and independently against the Azure SDK
+  directly.
+
 - [Feature] Initial release. `tutor-objectstorage` unifies three previously
   separate ways of configuring Open edX's object storage behind one config
   key, `OBJSTORAGE_BACKEND`:

@@ -198,3 +198,37 @@ def test_azure_with_acknowledgement_is_accepted() -> None:
 @pytest.mark.parametrize("backend", ["rustfs", "external_s3"])
 def test_backends_without_a_risk_gate_need_no_acknowledgement(backend: str) -> None:
     validate_objstorage_config({"OBJSTORAGE_BACKEND": backend})  # must not raise
+
+
+def test_tutor_dependency_does_not_exclude_current_tutor_releases() -> None:
+    """Regression test: `pip install tutor-objectstorage` must not downgrade
+    an existing Tutor install.
+
+    This plugin once declared ``tutor>=21.0.0,<22.0.0`` - a stale upper
+    bound nothing in this codebase actually requires (confirmed live: every
+    command used throughout TESTING.rst's Tiers 2-4 runs unmodified against
+    Tutor 22.0.2). Installing the plugin into any Tutor 22.x environment -
+    the version every other current Tutor plugin on PyPI depends on -
+    silently downgraded Tutor to the newest 21.x release instead, which
+    then breaks every other installed plugin's own `tutor<23.0.0,>=22.0.0`
+    constraint. `pip` reports this as a dependency conflict warning, not an
+    install failure, so it is easy to miss.
+
+    Importlib.metadata reads the dependency specifier Tutor itself (via
+    `tutor plugins list`) will see - the same place an accidental
+    re-narrowing of this bound would actually bite.
+    """
+    from importlib.metadata import requires
+
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+
+    dependencies = requires("tutor-objectstorage") or []
+    tutor_requirement = next(
+        Requirement(dep) for dep in dependencies if Requirement(dep).name == "tutor"
+    )
+    assert tutor_requirement.specifier.contains(Version("22.0.2"), prereleases=True), (
+        f"tutor-objectstorage's own 'tutor' dependency ({tutor_requirement.specifier}) "
+        "excludes tutor 22.0.2, the version every other current Tutor plugin "
+        "requires - this would silently downgrade Tutor on install"
+    )
