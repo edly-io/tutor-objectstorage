@@ -34,7 +34,7 @@ spec:
             - --addr=:9000
             - --auth-key={{ OPENEDX_AWS_ACCESS_KEY }},{{ OPENEDX_AWS_SECRET_ACCESS_KEY }}
             - --vfs-cache-mode=off
-            - --dir-cache-time=1s
+            - --dir-cache-time=10ms
           env:
             - name: RCLONE_CONFIG_AZUREBLOB_TYPE
               value: "azureblob"
@@ -86,7 +86,7 @@ spec:
             - --addr=:9000
             - --read-only
             - --vfs-cache-mode=off
-            - --dir-cache-time=1s
+            - --dir-cache-time=10ms
             - --include=/{{ OBJSTORAGE_BUCKET_NAME }}/**
             {% if OBJSTORAGE_DISCOVERY_BUCKET_NAME %}- --include=/{{ OBJSTORAGE_DISCOVERY_BUCKET_NAME }}/**{% endif %}
           env:

@@ -16,8 +16,11 @@ evaluation pass: ordinary Studio usage (exporting a course containing a
 SCORM component) hung the gateway via a completely unrelated mechanism — a
 zero-duration `--dir-cache-time` causing a directory-cache cleanup-timer
 goroutine storm inside rclone's VFS layer. Root-caused via a live Go
-goroutine dump and fixed by setting `--dir-cache-time=1s` instead of `0`;
-see [Finding 5](#finding-5-the-zero-duration-directory-cache-storm-fixed)
+goroutine dump and fixed by setting `--dir-cache-time=10ms` instead of `0`
+(an intermediate `=1s` fix, caught and corrected in the same pass, closed
+the storm but opened a read-after-write staleness window that broke this
+plugin's own live conformance suite); see
+[Finding 5](#finding-5-the-zero-duration-directory-cache-storm-fixed)
 for the full story, including a correction to an earlier, less precise
 version of this same finding. Finding 1 remains open and unfixed — it is a
 genuine defect in rclone itself with no plugin-side workaround — which is
@@ -251,7 +254,7 @@ cited when it killed its own version of this pattern.
 **Severity at the time it was found: higher practical risk than Finding 1 —
 no adversarial client behavior, no size threshold, no multipart upload
 required. Status: root-caused and fixed — both `rclonegw` processes now run
-with `--dir-cache-time=1s` instead of `=0`.**
+with `--dir-cache-time=10ms` instead of `=0`.**
 
 This was first discovered indirectly: a real Studio course export of a
 course containing a SCORM component hung at the "Compressing" stage
@@ -292,6 +295,7 @@ course), restarting only `rclonegw`/`rclonegw-public` between runs:
 |---|---|---|
 | `0` | 4 attempts | **Hung every time** (CPU pinned 110-157%, confirmed via `docker stats` and a goroutine dump) |
 | `1s`/`5s` | 9 attempts | **Succeeded every time** (0% CPU at rest throughout) |
+| `10ms` | 4 attempts | **Succeeded every time** (0.03% CPU at rest throughout) |
 
 Also directly observed: reverting back to `0` on an otherwise-idle gateway
 (no new requests at all) showed CPU climbing from ~0% to ~140% over the
@@ -299,20 +303,58 @@ following ~15 seconds and staying there — the cleanup-timer storm can build
 up in the background once triggered, independent of whether a client is
 still waiting on a response.
 
-**The fix**: `patches/azure/local-docker-compose-services` and
-`patches/azure/k8s-deployments` now set `--dir-cache-time=1s` for both
-`rclonegw` and `rclonegw-public` (previously `0`). This keeps the property
-the flag exists for — buckets created by `tutor local do init` become
-visible well within a second, not after the default 5-minute cache window —
-while avoiding the zero-duration edge case in rclone's own timer-rearming
-logic. This is a code fix, not a documentation-only note: unlike Finding 1
-(a genuine upstream rclone defect with no known workaround), this one was
-this plugin's own configuration choice, and changing it is enough to resolve
-it. Not yet filed upstream against rclone — the zero-duration cleanup-timer
+**First fix attempt (`=1s`) introduced its own regression — caught before
+shipping.** `rclonegw`'s own `HeadObject`/`GetObject` resolve a specific key
+by calling `vfs.Stat(path)`, which walks the path through the *same*
+per-directory `items` cache the cleanup storm came from (confirmed by
+reading rclone's own source: `cmd/serve/s3/backend.go`'s `HeadObject`/
+`GetObject` both call `_vfs.Stat(fp)`, and `vfs.Stat` resolves each path
+component via `dir.Stat`, backed by the cached listing `_readDir()`
+populates). Any nonzero `--dir-cache-time` therefore opens a window where a
+file written by one lookup of a directory isn't visible to a *different*
+lookup of the same directory until the cache expires. At `=1s` this window
+was long enough to break this plugin's own live conformance suite in CI: an
+ordinary `PutObject` immediately followed by a `HeadObject`/`GetObject` for
+the same key — not a corner case, exactly the pattern `test_s3_conformance_azure.py`
+and real Open edX code both do — returned `404`/`NoSuchKey` for several
+tests (`test_head_object_reports_size`, `test_copy_object`,
+`test_anonymous_read_on_public_bucket`, `test_range_request_returns_partial_content`,
+`test_concurrent_get_latency_does_not_scale_with_client_count`),
+reproduced locally against the real `tests/docker-compose.ci.yml` stack.
+
+**The fix**: `--dir-cache-time=10ms` — short enough that the write-then-read
+regression did not reproduce across repeated full conformance-suite runs
+locally (0 failures across 3 full runs, including the 20-concurrent-client
+latency test), while still passing the original livelock trigger (the real
+Studio/SCORM export) 4-for-4. `patches/azure/local-docker-compose-services`,
+`patches/azure/k8s-deployments`, and `tests/docker-compose.ci.yml` all use
+this value now. It keeps the property `--dir-cache-time` exists for —
+buckets created by `tutor local do init` become visible within
+milliseconds, not after the default 5-minute cache window — while avoiding
+both the zero-duration edge case and (as best as repeated local testing can
+show) the write-visibility regression a full second of caching introduced.
+This is a code fix, not a documentation-only note: unlike Finding 1 (a
+genuine upstream rclone defect with no known workaround), this one was this
+plugin's own configuration choice, and changing it is enough to resolve it.
+Not yet filed upstream against rclone — the zero-duration cleanup-timer
 behavior is still arguably a latent bug in rclone itself (nothing says
 `--dir-cache-time=0` should behave differently from "a very small but
 positive duration" beyond caching semantics), but this plugin no longer
 depends on anyone fixing it there.
+
+**This is a narrowed risk, not an eliminated one.** `10ms` is empirically
+safer than `1s` against both failure modes in every test run so far, but it
+is still a nonzero cache window, and a sufficiently tight write-then-read
+race (or a sufficiently slow Azure-side response stretching a directory
+refresh past 10ms while a concurrent write lands) could in principle still
+hit the same staleness gap, just far less often. No occurrence of it has
+been observed at `10ms` in any test run during this evaluation, including
+the deliberately-concurrent `test_concurrent_get_latency_does_not_scale_with_client_count`
+test, but "not observed" is not "proven impossible" — if real course
+imports/exports or video uploads start intermittently returning
+`NoSuchKey`/`404` immediately after a write on this backend, this is the
+first place to look, and a still-smaller value (or a different fix
+entirely) may be warranted.
 
 Confirmed against both the bundled Azurite and, for the original discovery,
 [floci-az](https://floci.io/az/) (an unrelated, independently implemented
@@ -355,7 +397,7 @@ storage path (a SCORM package is the easiest way to get one).
 | Backend maturity | `serve s3`: "Experimental" | RustFS 1.0.0 GA |
 | Multipart upload (standard order) | Works | Works |
 | Multipart upload (out-of-order parts) | **Hangs, reproducibly, ≥~300 MiB** — unfixed, no plugin-side workaround | No equivalent risk — no translation layer |
-| Listing an empty prefix (`listdir`/`ListObjectsV2` + `Delimiter`) | Fixed (`--dir-cache-time=1s`); see Finding 5 | No equivalent risk — no translation layer |
+| Listing an empty prefix (`listdir`/`ListObjectsV2` + `Delimiter`) | Fixed (`--dir-cache-time=10ms`); see Finding 5 | No equivalent risk — no translation layer |
 | Bucket-level anonymous read | Requires a second process + proxy routing | One native command |
 | CORS | Requires proxy-layer headers | Native default |
 | Local disk / non-root chown dance | None — stateless, no local volume | Required on fresh Linux installs |

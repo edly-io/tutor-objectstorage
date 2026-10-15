@@ -14,21 +14,30 @@
   directory's mutex, pinning the gateway at 100%+ CPU until it stops
   responding to every request - triggered by ordinary Studio usage
   (exporting a course containing a SCORM component), not adversarial
-  behavior. Fixed by changing `--dir-cache-time` from `0` to `1s` in both
-  `patches/azure/local-docker-compose-services` and
-  `patches/azure/k8s-deployments` (and the CI compose stand-in), which keeps
-  the property the flag exists for (buckets appear well within a second of
-  `tutor local do init`, not after a 5-minute cache window) while avoiding
-  the zero-duration edge case. Verified via a direct A/B against the real
-  trigger: 4/4 reproducible hangs at `=0`, 9/9 clean runs at `=1s`/`=5s`,
-  with no further CPU-pinning observed. This also **corrects** the previous
-  `[Finding]` entry below (and the `EVALUATION.md` Finding 5 it introduced):
-  that entry's claim of a minimal, standalone boto3 reproduction did not
-  hold up under further testing - the apparent single-call reproduction was
-  an artifact of replaying the same call against a gateway a stuck client
-  was still hammering in a retry loop, not evidence that any single
-  isolated call triggers this on its own. `EVALUATION.md` Finding 5 has been
-  rewritten to describe the actual root cause, the correction, and the fix.
+  behavior. An initial fix changed `--dir-cache-time` from `0` to `1s`,
+  which cleared the livelock (4/4 reproducible hangs at `=0`, 9/9 clean runs
+  at `=1s`/`=5s`) but introduced its own regression, caught before merging:
+  `rclonegw`'s `HeadObject`/`GetObject` resolve a key via the same
+  per-directory cache the cleanup storm came from, so a full second of
+  caching was long enough for an ordinary `PutObject` immediately followed
+  by a `HeadObject`/`GetObject` for the same key to intermittently return
+  `404`/`NoSuchKey` - breaking this plugin's own live conformance suite in
+  CI. Settled on `--dir-cache-time=10ms`: short enough that the
+  write-then-read regression did not reproduce across repeated full
+  conformance-suite runs locally, while still clearing the original
+  livelock trigger (the real Studio/SCORM export) 4/4 further attempts.
+  Applied to `patches/azure/local-docker-compose-services`,
+  `patches/azure/k8s-deployments`, and the CI compose stand-in. This also
+  **corrects** the previous `[Finding]` entry below (and the
+  `EVALUATION.md` Finding 5 it introduced): that entry's claim of a
+  minimal, standalone boto3 reproduction did not hold up under further
+  testing - the apparent single-call reproduction was an artifact of
+  replaying the same call against a gateway a stuck client was still
+  hammering in a retry loop, not evidence that any single isolated call
+  triggers this on its own. `EVALUATION.md` Finding 5 has been rewritten to
+  describe the actual root cause, both corrections, and the fix - including
+  an explicit note that `10ms` narrows the staleness window rather than
+  eliminating it, and what to look for if it's ever hit in practice.
 
 - [Finding] A second full live-content pass through all three backends -
   this time through the actual running Open edX application (a real login,
