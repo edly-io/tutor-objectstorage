@@ -4,6 +4,32 @@
 
 ## Unreleased
 
+- [Bugfix] The `azure` backend's `rclonegw`/`rclonegw-public` processes ran
+  with `--dir-cache-time=0`, which does not mean "caching disabled" - it
+  means every directory-cache entry is immediately expired, which drives
+  rclone's VFS layer's per-directory cleanup timer to re-arm itself with no
+  effective delay. Root-caused via a live Go goroutine dump
+  (`docker kill --signal=SIGQUIT`) showing a storm of
+  `vfs.(*Dir).cacheCleanup`/`ForgetAll` goroutines deadlocked on the same
+  directory's mutex, pinning the gateway at 100%+ CPU until it stops
+  responding to every request - triggered by ordinary Studio usage
+  (exporting a course containing a SCORM component), not adversarial
+  behavior. Fixed by changing `--dir-cache-time` from `0` to `1s` in both
+  `patches/azure/local-docker-compose-services` and
+  `patches/azure/k8s-deployments` (and the CI compose stand-in), which keeps
+  the property the flag exists for (buckets appear well within a second of
+  `tutor local do init`, not after a 5-minute cache window) while avoiding
+  the zero-duration edge case. Verified via a direct A/B against the real
+  trigger: 4/4 reproducible hangs at `=0`, 9/9 clean runs at `=1s`/`=5s`,
+  with no further CPU-pinning observed. This also **corrects** the previous
+  `[Finding]` entry below (and the `EVALUATION.md` Finding 5 it introduced):
+  that entry's claim of a minimal, standalone boto3 reproduction did not
+  hold up under further testing - the apparent single-call reproduction was
+  an artifact of replaying the same call against a gateway a stuck client
+  was still hammering in a retry loop, not evidence that any single
+  isolated call triggers this on its own. `EVALUATION.md` Finding 5 has been
+  rewritten to describe the actual root cause, the correction, and the fix.
+
 - [Finding] A second full live-content pass through all three backends -
   this time through the actual running Open edX application (a real login,
   a real profile-picture upload, and a real Studio course export/import

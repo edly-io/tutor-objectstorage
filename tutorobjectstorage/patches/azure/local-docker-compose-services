@@ -13,10 +13,23 @@
 # EVALUATION.md for why this two-process split exists at all: rclone's
 # `serve s3` has no bucket-level ACL/policy mechanism, unlike RustFS/MinIO.
 #
-# `--dir-cache-time=0` on both: the default 5-minute cache would otherwise
+# `--dir-cache-time=1s` on both: the default 5-minute cache would otherwise
 # let a process started before `tutor local do init` creates the Azure
-# containers keep serving a stale, empty bucket list until the cache
-# expires.
+# containers keep serving a stale, empty bucket list for up to 5 minutes.
+# This was `=0` (no caching at all) until EVALUATION.md Finding 5: `0` is
+# not "cache disabled", it's "every directory lookup's cache entry is
+# permanently and immediately expired", which drives rclone's VFS layer's
+# per-directory cleanup timer to re-arm itself with no effective delay -
+# confirmed via a live Go goroutine dump showing thousands of
+# `vfs.(*Dir).cacheCleanup`/`ForgetAll` goroutines (all spawned by
+# `time.goFunc`) deadlocked contending for the same directory's mutex,
+# pinning the gateway at 100%+ CPU until it stops responding to every
+# request, not only the one that touched that directory. A short but
+# nonzero duration keeps the "see buckets quickly after init" property
+# this flag exists for, without hitting that zero-duration edge case -
+# re-run five times against the real failure trigger (a Studio course
+# export of a course containing a SCORM component) with zero hangs, vs.
+# hanging on every single attempt at `=0`.
 #
 # Azure containers stay fully private at the Azure IAM layer the whole
 # time; nothing here ever changes a native Azure ACL — "public" is purely
@@ -34,7 +47,7 @@ rclonegw:
     - --addr=:9000
     - --auth-key={{ OPENEDX_AWS_ACCESS_KEY }},{{ OPENEDX_AWS_SECRET_ACCESS_KEY }}
     - --vfs-cache-mode=off
-    - --dir-cache-time=0
+    - --dir-cache-time=1s
   environment:
     RCLONE_CONFIG_AZUREBLOB_TYPE: "azureblob"
     RCLONE_CONFIG_AZUREBLOB_ACCOUNT: "{{ OBJSTORAGE_AZURE_ACCOUNT }}"
@@ -60,7 +73,7 @@ rclonegw-public:
     - --addr=:9000
     - --read-only
     - --vfs-cache-mode=off
-    - --dir-cache-time=0
+    - --dir-cache-time=1s
     - --include=/{{ OBJSTORAGE_BUCKET_NAME }}/**
     {% if OBJSTORAGE_DISCOVERY_BUCKET_NAME %}- --include=/{{ OBJSTORAGE_DISCOVERY_BUCKET_NAME }}/**{% endif %}
   environment:

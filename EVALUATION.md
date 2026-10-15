@@ -5,23 +5,23 @@
 also set `OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK=true`, and this document is what
 you're acknowledging. `rclone serve s3` reliably and reproducibly **hangs** —
 a livelocked process pinned at 100%+ CPU, zero network progress, that does
-not self-recover and needs a container restart — in two independently
-confirmed cases:
+not self-recover and needs a container restart — when multipart upload
+parts arrive out of ascending order, once the upload crosses a few hundred
+MiB — nothing more adversarial than the S3 API's own explicitly-permitted
+"parts may be uploaded in any order" behavior. See
+[Finding 1](#finding-1-the-multipart-hang-headline).
 
-1. When multipart upload parts arrive out of ascending order, once the
-   upload crosses a few hundred MiB — nothing more adversarial than the S3
-   API's own explicitly-permitted "parts may be uploaded in any order"
-   behavior. See [Finding 1](#finding-1-the-multipart-hang-headline).
-2. **On a single `ListObjects`/`ListObjectsV2` call with a `Delimiter`
-   against a prefix that has zero objects under it** — no multipart upload,
-   no adversarial ordering, no size threshold required. This is the "does
-   this folder exist yet" check `django-storages`' `S3Boto3Storage.listdir()`
-   performs, and it is triggered by completely ordinary Studio usage: this
-   evaluation hit it exporting a real course that happens to contain a SCORM
-   component, through the unmodified Studio UI, on the very first export.
-   See [Finding 5](#finding-5-listing-an-empty-prefix-hangs-the-gateway) —
-   arguably the more operationally important of the two, since it needs no
-   adversarial client behavior at all to trigger.
+A second, independent livelock was found and **fixed** during this same
+evaluation pass: ordinary Studio usage (exporting a course containing a
+SCORM component) hung the gateway via a completely unrelated mechanism — a
+zero-duration `--dir-cache-time` causing a directory-cache cleanup-timer
+goroutine storm inside rclone's VFS layer. Root-caused via a live Go
+goroutine dump and fixed by setting `--dir-cache-time=1s` instead of `0`;
+see [Finding 5](#finding-5-the-zero-duration-directory-cache-storm-fixed)
+for the full story, including a correction to an earlier, less precise
+version of this same finding. Finding 1 remains open and unfixed — it is a
+genuine defect in rclone itself with no plugin-side workaround — which is
+why the risk acknowledgment stays required.
 
 Both were found against the backend's default target (Azurite), confirmed a
 second time against a different, independent Azure Blob Storage emulator
@@ -91,11 +91,11 @@ against the CI compose stack, and re-confirmed live when this backend was
 folded into the unified `tutor-objectstorage` plugin:
 
 - **Generic S3 operations** — `ListBuckets`, `PutObject`/`GetObject`,
-  `HeadObject`, presigned URLs, `ListObjectsV2` *(when at least one object
-  already exists under the listed prefix — see
-  [Finding 5](#finding-5-listing-an-empty-prefix-hangs-the-gateway) for the
-  case that doesn't)*, server-side `CopyObject`, `DeleteObject` — all work
-  exactly as they do against the `rustfs` backend.
+  `HeadObject`, presigned URLs, `ListObjectsV2` *(including against an empty
+  prefix — this used to livelock the gateway before the fix in
+  [Finding 5](#finding-5-the-zero-duration-directory-cache-storm-fixed))*,
+  server-side `CopyObject`, `DeleteObject` — all work exactly as they do
+  against the `rustfs` backend.
 - **The anonymous/private bucket split holds, robustly.** rclone's `serve s3`
   has no bucket-level ACL mechanism at all (unlike RustFS's `rc anonymous set
   download`), so this backend runs two `rclone serve s3` processes — one
@@ -246,67 +246,85 @@ but they are real operational surface this architecture adds, exactly the
 kind of "maintaining correct per-backend translation is expensive" cost MinIO
 cited when it killed its own version of this pattern.
 
-### Finding 5: listing an empty prefix hangs the gateway
+### Finding 5: the zero-duration directory-cache storm (fixed)
 
-**Severity: higher practical risk than Finding 1 — needs no adversarial
-client behavior, no size threshold, and no multipart upload at all.**
-
-Minimal, backend-agnostic reproduction (no Django, no Open edX, no SCORM
-involved):
-
-```python
-import boto3
-s3 = boto3.client("s3", endpoint_url="http://<gateway-host>", ...)
-# Hangs indefinitely; rclonegw pins at 140-165% CPU within seconds.
-s3.get_paginator("list_objects").paginate(
-    Bucket="openedx", Delimiter="/", Prefix="definitely-does-not-exist/"
-)
-```
-
-The identical call against a prefix with **at least one object already
-under it** returns in under 50ms. The only variable is whether the prefix is
-empty. `docker stats` during the hang showed the same signature as Finding 1
-— 140-166% CPU, near-zero memory growth, the client blocked on
-`socket.recv` waiting for response headers that never arrive — and, also
-like Finding 1, **no self-recovery**: restarting `rclonegw` alone was not
-enough to clear it, because the original stuck client (still inside its
-retry loop) reconnected and re-issued the identical request against the
-freshly-restarted gateway, re-triggering the livelock within seconds. Both
-the gateway *and* the stuck client have to be restarted together.
+**Severity at the time it was found: higher practical risk than Finding 1 —
+no adversarial client behavior, no size threshold, no multipart upload
+required. Status: root-caused and fixed — both `rclonegw` processes now run
+with `--dir-cache-time=1s` instead of `=0`.**
 
 This was first discovered indirectly: a real Studio course export of a
 course containing a SCORM component hung at the "Compressing" stage
-indefinitely. `openedx-scorm-xblock`'s `path_exists()` calls
-`django-storages`' `S3Boto3Storage.listdir()`
-(`storages/backends/s3.py:597`) to check whether the package's extraction
-folder already exists — which, on a course's first export, it never does.
-`listdir()` issues exactly the paginated `list_objects` + `Delimiter="/"`
-call shown above. The same course exported in 1-2 seconds against both the
-`rustfs` and `external_s3` backends; only the `azure` backend hung, and only
-on this specific call shape.
+indefinitely, `rclonegw` pinned at 140-166% CPU with zero network progress.
+`openedx-scorm-xblock`'s `path_exists()` calls `django-storages`'
+`S3Boto3Storage.listdir()` (`storages/backends/s3.py:597`) to check whether
+the package's extraction folder already exists — which, on a course's first
+export, it never does. The same course exported in 1-2 seconds against both
+the `rustfs` and `external_s3` backends; only `azure` hung.
 
-**Why this matters more than Finding 1 in practice**: Finding 1 requires an
-upload crossing a size threshold with parts delivered out of order — a
-pattern most ordinary clients (including boto3's own default
-`TransferConfig`) don't produce. This one requires nothing beyond "ask
-whether an empty folder exists," which is an unremarkable, common operation
-— `S3Boto3Storage.listdir()`/`.exists()`-style folder checks appear
-throughout Open edX and third-party XBlocks, not only in the SCORM XBlock
-used to find this. Any such check against a path that hasn't been written to
-yet will hit this.
+**An earlier version of this finding claimed a minimal, standalone boto3
+reproduction — that claim was wrong, and is corrected here.** The exact same
+`list_objects`/`Delimiter` call that appeared to hang in isolation does
+**not** reliably hang when replayed against a freshly-started `rclonegw`:
+across repeated attempts (fresh container, exact real prefix, single calls,
+8 concurrent calls, 200 sequential calls) it consistently returned in under
+60ms. The original "isolated" repro wasn't actually isolated — it was
+replayed against a gateway a stuck Celery client was still hammering in a
+retry loop, so the appearance of a clean single-call reproduction was an
+artifact of that retry storm, not evidence that any single call triggers
+it on its own. Lesson for next time: before writing a minimal reproduction
+into a finding, retest it against a target *you provisioned fresh for that
+specific test* — don't just reconfirm the symptom and infer the trigger.
 
-Confirmed twice, independently: against the bundled Azurite, and separately
-against [floci-az](https://floci.io/az/) (an unrelated, independently
-implemented Azure Blob Storage emulator) with no code or config changes
-beyond the endpoint — ruling out an Azurite-specific quirk. Tested against
-the same pinned `docker.io/rclone/rclone:1.75.1` as every other finding
-here.
+**Root cause, found via a live Go goroutine dump (`docker kill
+--signal=SIGQUIT rclonegw`, which rclone handles by dumping all goroutine
+stacks before exiting):** every blocked goroutine was waiting on
+`sync.(*RWMutex).Lock` inside `github.com/rclone/rclone/vfs.(*Dir).cacheCleanup`
+or `vfs.(*Dir).ForgetAll` (`vfs/dir.go:85` and `:230`), each one spawned by
+`time.goFunc` — i.e., a *periodic directory-cache cleanup timer*, one per
+VFS directory node. `--dir-cache-time=0` does not mean "caching disabled";
+it means every cache entry is permanently and immediately expired, which
+drives this cleanup timer to re-arm itself with no effective delay. Confirmed
+with a direct A/B on the real trigger (a Studio export of the SCORM-containing
+course), restarting only `rclonegw`/`rclonegw-public` between runs:
 
-**How to reproduce**: enable the `azure` backend, run `tutor local launch`,
-log into Studio, and export any course containing an XBlock whose rendering
-checks for a not-yet-created storage path (a SCORM package is the easiest
-way to get one) — or skip Open edX entirely and run the minimal boto3
-snippet above directly against a running `rclonegw`.
+| `--dir-cache-time` | Real Studio export, repeated | Result |
+|---|---|---|
+| `0` | 4 attempts | **Hung every time** (CPU pinned 110-157%, confirmed via `docker stats` and a goroutine dump) |
+| `1s`/`5s` | 9 attempts | **Succeeded every time** (0% CPU at rest throughout) |
+
+Also directly observed: reverting back to `0` on an otherwise-idle gateway
+(no new requests at all) showed CPU climbing from ~0% to ~140% over the
+following ~15 seconds and staying there — the cleanup-timer storm can build
+up in the background once triggered, independent of whether a client is
+still waiting on a response.
+
+**The fix**: `patches/azure/local-docker-compose-services` and
+`patches/azure/k8s-deployments` now set `--dir-cache-time=1s` for both
+`rclonegw` and `rclonegw-public` (previously `0`). This keeps the property
+the flag exists for — buckets created by `tutor local do init` become
+visible well within a second, not after the default 5-minute cache window —
+while avoiding the zero-duration edge case in rclone's own timer-rearming
+logic. This is a code fix, not a documentation-only note: unlike Finding 1
+(a genuine upstream rclone defect with no known workaround), this one was
+this plugin's own configuration choice, and changing it is enough to resolve
+it. Not yet filed upstream against rclone — the zero-duration cleanup-timer
+behavior is still arguably a latent bug in rclone itself (nothing says
+`--dir-cache-time=0` should behave differently from "a very small but
+positive duration" beyond caching semantics), but this plugin no longer
+depends on anyone fixing it there.
+
+Confirmed against both the bundled Azurite and, for the original discovery,
+[floci-az](https://floci.io/az/) (an unrelated, independently implemented
+Azure Blob Storage emulator) — ruling out an Azurite-specific quirk. Tested
+against the same pinned `docker.io/rclone/rclone:1.75.1` as every other
+finding here.
+
+**How to reproduce the original hang** (on a version of this plugin before
+this fix, or with `--dir-cache-time` manually reverted to `0`): enable the
+`azure` backend, run `tutor local launch`, log into Studio, and export any
+course containing an XBlock whose rendering checks for a not-yet-created
+storage path (a SCORM package is the easiest way to get one).
 
 ### Known, from rclone's own documentation and issue tracker (context for Finding 1, not independently re-verified here)
 
@@ -336,8 +354,8 @@ snippet above directly against a running `rclonegw`.
 | Architecture | Translation layer (S3 → Azure) | Native S3 engine |
 | Backend maturity | `serve s3`: "Experimental" | RustFS 1.0.0 GA |
 | Multipart upload (standard order) | Works | Works |
-| Multipart upload (out-of-order parts) | **Hangs, reproducibly, ≥~300 MiB** | No equivalent risk — no translation layer |
-| Listing an empty prefix (`listdir`/`ListObjectsV2` + `Delimiter`) | **Hangs, reproducibly, any size** | No equivalent risk — no translation layer |
+| Multipart upload (out-of-order parts) | **Hangs, reproducibly, ≥~300 MiB** — unfixed, no plugin-side workaround | No equivalent risk — no translation layer |
+| Listing an empty prefix (`listdir`/`ListObjectsV2` + `Delimiter`) | Fixed (`--dir-cache-time=1s`); see Finding 5 | No equivalent risk — no translation layer |
 | Bucket-level anonymous read | Requires a second process + proxy routing | One native command |
 | CORS | Requires proxy-layer headers | Native default |
 | Local disk / non-root chown dance | None — stateless, no local volume | Required on fresh Linux installs |
@@ -366,13 +384,14 @@ and presumed-but-unconfirmed against real Azure.
 
 Do not point production course data at the `azure` backend. The two-process
 anonymous-bucket design works and was validated thoroughly, which is the good
-news — but Findings 1 and 5 are exactly the kind of result this backend was
-built to find: real, reproducible, severe failures — one in large multipart
-uploads (the operation that broke MinIO's version of this same architecture
-for this same community, now independently reproduced in a different
-implementation), and one in an everyday "does this folder exist yet" check
-that needs no adversarial client behavior at all and was found through
-completely ordinary Studio usage. The `rustfs` backend carries none of this risk
+news, and Finding 5's livelock — found through completely ordinary Studio
+usage, no adversarial behavior required — turned out to be fixable with a
+one-line config change once root-caused. But Finding 1 is exactly the kind
+of result this backend was built to find: a real, reproducible, severe
+failure in large multipart uploads (the operation that broke MinIO's version
+of this same architecture for this same community, now independently
+reproduced in a different implementation) with no known fix. The `rustfs`
+backend carries none of this risk
 class, because it never translates between two different storage models in
 the first place — use it, or the `external_s3` backend against a real
 S3-compatible provider, unless Azure is a hard requirement. If it is, the
