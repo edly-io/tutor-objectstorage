@@ -359,10 +359,13 @@ Known failure modes
    * - ``rclonegw`` is pinned near 100%+ CPU with no network I/O, and stops
        responding
      - azure
-     - The multipart hang (``EVALUATION.md`` Finding 1) or the empty-prefix
-       listing hang (Finding 5 — far easier to hit: triggered by exporting
-       any course with a SCORM component, or any ``listdir()``/``exists()``
-       check against a path nothing has been written to yet).
+     - The multipart hang — see ``EVALUATION.md`` Finding 1. (A second,
+       unrelated cause — a zero-duration ``--dir-cache-time`` causing a
+       directory-cache cleanup-timer storm, triggered by exporting any
+       course with a SCORM component — was found and fixed; see Finding 5.
+       If you're running a version of this plugin from before that fix, or
+       have manually overridden ``--dir-cache-time`` back to ``0``, you can
+       still hit it.)
        ``tutor local restart rclonegw`` alone is often **not** enough: if the
        client that triggered it is still retrying (e.g. a stuck Celery
        task), it immediately re-triggers the hang against the freshly

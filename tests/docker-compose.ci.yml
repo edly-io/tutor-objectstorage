@@ -21,7 +21,7 @@ services:
       - --addr=:9000
       - --auth-key=openedx,test-secret-key-for-ci-only
       - --vfs-cache-mode=off
-      - --dir-cache-time=0
+      - --dir-cache-time=10ms
     environment: &azureblob-env
       RCLONE_CONFIG_AZUREBLOB_TYPE: "azureblob"
       RCLONE_CONFIG_AZUREBLOB_ACCOUNT: "devstoreaccount1"
@@ -38,7 +38,7 @@ services:
       - --addr=:9000
       - --read-only
       - --vfs-cache-mode=off
-      - --dir-cache-time=0
+      - --dir-cache-time=10ms
       - --include=/openedx/**
     environment: *azureblob-env
     ports:

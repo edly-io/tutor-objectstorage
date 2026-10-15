@@ -4,6 +4,41 @@
 
 ## Unreleased
 
+- [Bugfix] The `azure` backend's `rclonegw`/`rclonegw-public` processes ran
+  with `--dir-cache-time=0`, which does not mean "caching disabled" - it
+  means every directory-cache entry is immediately expired, which drives
+  rclone's VFS layer's per-directory cleanup timer to re-arm itself with no
+  effective delay. Root-caused via a live Go goroutine dump
+  (`docker kill --signal=SIGQUIT`) showing a storm of
+  `vfs.(*Dir).cacheCleanup`/`ForgetAll` goroutines deadlocked on the same
+  directory's mutex, pinning the gateway at 100%+ CPU until it stops
+  responding to every request - triggered by ordinary Studio usage
+  (exporting a course containing a SCORM component), not adversarial
+  behavior. An initial fix changed `--dir-cache-time` from `0` to `1s`,
+  which cleared the livelock (4/4 reproducible hangs at `=0`, 9/9 clean runs
+  at `=1s`/`=5s`) but introduced its own regression, caught before merging:
+  `rclonegw`'s `HeadObject`/`GetObject` resolve a key via the same
+  per-directory cache the cleanup storm came from, so a full second of
+  caching was long enough for an ordinary `PutObject` immediately followed
+  by a `HeadObject`/`GetObject` for the same key to intermittently return
+  `404`/`NoSuchKey` - breaking this plugin's own live conformance suite in
+  CI. Settled on `--dir-cache-time=10ms`: short enough that the
+  write-then-read regression did not reproduce across repeated full
+  conformance-suite runs locally, while still clearing the original
+  livelock trigger (the real Studio/SCORM export) 4/4 further attempts.
+  Applied to `patches/azure/local-docker-compose-services`,
+  `patches/azure/k8s-deployments`, and the CI compose stand-in. This also
+  **corrects** the previous `[Finding]` entry below (and the
+  `EVALUATION.md` Finding 5 it introduced): that entry's claim of a
+  minimal, standalone boto3 reproduction did not hold up under further
+  testing - the apparent single-call reproduction was an artifact of
+  replaying the same call against a gateway a stuck client was still
+  hammering in a retry loop, not evidence that any single isolated call
+  triggers this on its own. `EVALUATION.md` Finding 5 has been rewritten to
+  describe the actual root cause, both corrections, and the fix - including
+  an explicit note that `10ms` narrows the staleness window rather than
+  eliminating it, and what to look for if it's ever hit in practice.
+
 - [Finding] A second full live-content pass through all three backends -
   this time through the actual running Open edX application (a real login,
   a real profile-picture upload, and a real Studio course export/import

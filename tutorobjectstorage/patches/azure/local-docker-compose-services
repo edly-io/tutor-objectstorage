@@ -13,10 +13,33 @@
 # EVALUATION.md for why this two-process split exists at all: rclone's
 # `serve s3` has no bucket-level ACL/policy mechanism, unlike RustFS/MinIO.
 #
-# `--dir-cache-time=0` on both: the default 5-minute cache would otherwise
-# let a process started before `tutor local do init` creates the Azure
-# containers keep serving a stale, empty bucket list until the cache
-# expires.
+# `--dir-cache-time=10ms` on both: this was `=0` until EVALUATION.md
+# Finding 5. `0` is not "cache disabled", it's "every directory lookup's
+# cache entry is permanently and immediately expired", which drives
+# rclone's VFS layer's per-directory cleanup timer to re-arm itself with
+# no effective delay - confirmed via a live Go goroutine dump showing a
+# storm of `vfs.(*Dir).cacheCleanup`/`ForgetAll` goroutines (all spawned by
+# `time.goFunc`) contending for the same directory's mutex, pinning the
+# gateway at 100%+ CPU until it stops responding to every request, not
+# only the one that touched that directory - triggered by ordinary Studio
+# usage (exporting a course containing a SCORM component), not adversarial
+# behavior.
+#
+# A nonzero value fixes that, but introduces its own trade-off: for as
+# long as a directory's listing stays cached, a file written by a
+# *different* lookup of the same directory won't show up in it - rclone's
+# own `HeadObject`/`GetObject` resolve a specific key by consulting the
+# same per-directory cache the listing storm came from. `=1s` first (the
+# value tried here) passed the real-world trigger five-for-five but broke
+# this plugin's own live conformance suite in CI: a `PutObject` immediately
+# followed by a `HeadObject`/`GetObject` for the same key - an ordinary
+# write-then-read pattern, not a corner case - returned `404`/`NoSuchKey`
+# for several tests. `10ms` is short enough that this didn't reproduce
+# across repeated full suite runs locally, while still passing the
+# original livelock trigger (the real Studio/SCORM export) on every
+# attempt - still long enough to dodge the zero-duration edge case, and
+# still short enough that "see buckets quickly after init" holds in
+# practice.
 #
 # Azure containers stay fully private at the Azure IAM layer the whole
 # time; nothing here ever changes a native Azure ACL — "public" is purely
@@ -34,7 +57,7 @@ rclonegw:
     - --addr=:9000
     - --auth-key={{ OPENEDX_AWS_ACCESS_KEY }},{{ OPENEDX_AWS_SECRET_ACCESS_KEY }}
     - --vfs-cache-mode=off
-    - --dir-cache-time=0
+    - --dir-cache-time=10ms
   environment:
     RCLONE_CONFIG_AZUREBLOB_TYPE: "azureblob"
     RCLONE_CONFIG_AZUREBLOB_ACCOUNT: "{{ OBJSTORAGE_AZURE_ACCOUNT }}"
@@ -60,7 +83,7 @@ rclonegw-public:
     - --addr=:9000
     - --read-only
     - --vfs-cache-mode=off
-    - --dir-cache-time=0
+    - --dir-cache-time=10ms
     - --include=/{{ OBJSTORAGE_BUCKET_NAME }}/**
     {% if OBJSTORAGE_DISCOVERY_BUCKET_NAME %}- --include=/{{ OBJSTORAGE_DISCOVERY_BUCKET_NAME }}/**{% endif %}
   environment:
