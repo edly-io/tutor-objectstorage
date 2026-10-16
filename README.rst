@@ -29,13 +29,19 @@ replaced or depended upon by this one.
 
 
 
-   **The ``azure`` backend is not safe for production course content yet.**
+   **The ``azure`` backend has a known residual risk for very large,
+   adversarially-ordered uploads — read the details before relying on it.**
 
    This plugin's own live conformance suite reproducibly hangs ``rclone serve
-   s3`` when multipart upload parts arrive out of ascending order.
+   s3`` when multipart upload parts arrive out of ascending order and exceed
+   ``OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`` (2GiB by default). Root-caused
+   and narrowed, not eliminated: ordinary, non-adversarial uploads (including
+   boto3's own default multipart behavior) were never actually at much risk,
+   and the configured buffer can be raised further for deployments with
+   larger course videos — see ``EVALUATION.md`` Finding 1.
 
-   Read `EVALUATION.md <EVALUATION.md>`_ before using this backend for anything
-   beyond evaluation.
+   Read `EVALUATION.md <EVALUATION.md>`_ before using this backend for
+   anything beyond evaluation.
 
 
 
@@ -154,6 +160,15 @@ handles this automatically via ``fsGroup``.)
   ``https://<account>.blob.core.windows.net``).
 - ``OBJSTORAGE_AZURE_AZURITE_DOCKER_IMAGE`` (default:
   ``"mcr.microsoft.com/azure-storage/azurite:3.37.0"``)
+- ``OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`` (default: ``"2G"``) — memory
+  ``rclonegw`` will buffer, per in-flight multipart upload, for parts that
+  arrive before the part it's actually waiting to write next (the S3 API
+  allows parts to arrive in any order). Raised past rclone's own 256MiB
+  default because a single out-of-order video upload can legitimately
+  exceed that; still a bound, not unlimited (rclone accepts ``"0"`` for
+  that, not recommended — see `EVALUATION.md <EVALUATION.md>`_ Finding 1).
+  If your course videos routinely exceed this, raise it further, at the
+  cost of more worst-case memory per concurrent multipart upload.
 
 There is no console setting for this backend: rclone has no web console or
 bucket browser. Use the Azure Portal, Azure Storage Explorer, or

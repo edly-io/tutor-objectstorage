@@ -58,6 +58,7 @@ rclonegw:
     - --auth-key={{ OPENEDX_AWS_ACCESS_KEY }},{{ OPENEDX_AWS_SECRET_ACCESS_KEY }}
     - --vfs-cache-mode=off
     - --dir-cache-time=10ms
+    - --multipart-streaming-buffer-limit={{ OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT }}
   environment:
     RCLONE_CONFIG_AZUREBLOB_TYPE: "azureblob"
     RCLONE_CONFIG_AZUREBLOB_ACCOUNT: "{{ OBJSTORAGE_AZURE_ACCOUNT }}"

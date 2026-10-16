@@ -22,6 +22,7 @@ services:
       - --auth-key=openedx,test-secret-key-for-ci-only
       - --vfs-cache-mode=off
       - --dir-cache-time=10ms
+      - --multipart-streaming-buffer-limit=2G
     environment: &azureblob-env
       RCLONE_CONFIG_AZUREBLOB_TYPE: "azureblob"
       RCLONE_CONFIG_AZUREBLOB_ACCOUNT: "devstoreaccount1"

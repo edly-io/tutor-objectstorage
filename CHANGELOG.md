@@ -4,6 +4,38 @@
 
 ## Unreleased
 
+- [Bugfix] `EVALUATION.md` Finding 1 (the out-of-order multipart hang,
+  documented since this plugin's initial release as "do not use for
+  production course content until this is understood or fixed upstream")
+  has been root-caused and mitigated, not merely documented. Reading
+  rclone's own source (`cmd/serve/s3/multipart.go`) after reproducing the
+  hang live and capturing a Go goroutine dump showed it blocked in
+  `waitForTurn` on a `sync.Cond.Wait()` - a genuine request-level deadlock,
+  not a spin: `serve s3` writes multipart uploads through the VFS strictly
+  in part order, holding out-of-order parts in a bounded in-memory reorder
+  buffer (rclone's own `--multipart-streaming-buffer-limit`, default
+  256MiB, "0 for unlimited"); a client that delivers parts in strict
+  descending order one at a time fills that buffer before the part that
+  would drain it ever arrives.
+
+  New config key `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT` (default `"2G"`)
+  raises this on the authenticated `rclonegw` only (`rclonegw-public` is
+  `--read-only` and never reaches this code path). Re-ran the full original
+  adversarial test matrix (300-350 MiB, concurrency 1/2/4/8/10, strictly
+  reversed part order) against the raised limit: every case that
+  previously hung now passes, with correct final object size and zero
+  residual CPU usage. This is a narrowed risk, not an eliminated one - an
+  upload larger than the configured buffer, delivered in sufficiently
+  reversed order, can still hit the same wait, and operators with larger
+  course videos should raise this further. `EVALUATION.md`'s headline
+  summary, Finding 1, the backend comparison table, and the recommendation
+  section are all rewritten to describe the actual mechanism and its fix
+  instead of "no known fix, don't use this backend for real content."
+  `TESTING.rst` and the CI workflow are updated to match, including
+  promoting the previously manually-gated adversarial test
+  (`OBJSTORAGE_TEST_REAL_AZURE_GATE=1`) to run automatically on every PR
+  (pinned to 350 MiB) as the standing regression guard for this fix.
+
 - [Bugfix] The `azure` backend's `rclonegw`/`rclonegw-public` processes ran
   with `--dir-cache-time=0`, which does not mean "caching disabled" - it
   means every directory-cache entry is immediately expired, which drives

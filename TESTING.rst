@@ -224,27 +224,39 @@ gateway:
   **Confirmed quirk, not a test bug**: the HTTP status stays ``200`` rather
   than the spec-required ``206`` — see ``EVALUATION.md`` Finding 3.
 - A **350 MiB**, normally-ordered (boto3-managed) multipart upload — past
-  rclone's 256 MiB default streaming buffer. This passes cleanly and
-  quickly. It does **not** mean multipart uploads are safe here — see the
-  next paragraph.
+  rclone's own 256 MiB default streaming buffer (this backend now raises
+  that limit; see ``OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`` below). This
+  passes cleanly and quickly, and is testing ordinary delivery order at a
+  realistic size, not the buffer boundary itself - in-order parts admit
+  immediately regardless of how full the buffer is. The adversarial test
+  below is what actually exercises that boundary.
 
 **A more adversarial multipart test, run during tutor-rclone-gateway's own
 evaluation (this backend's predecessor), found a reproducible hang — against
 Azurite, before ever reaching Tier 5.** Parts submitted via raw
 ``upload_part`` calls in **strictly reversed order** complete fine up to
 260 MiB and hang indefinitely (CPU pinned, zero network progress, no
-self-recovery) at 300 MiB and above, confirmed at concurrency=1 alone (not
-concurrency-dependent). Full details, exact reproduction steps, and the
-bisection table are in ``EVALUATION.md``. This is gated the same way as Tier
-5 below (``OBJSTORAGE_TEST_REAL_AZURE_GATE=1``) but reproduces against the
-default Azurite backend — you do not need real Azure credentials to see it.
+self-recovery) at 300 MiB and above *at rclone's own 256 MiB default
+``--multipart-streaming-buffer-limit``*, confirmed at concurrency=1 alone
+(not concurrency-dependent). Root-caused to that buffer limit and fixed in
+this plugin by raising ``OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`` to 2GiB
+by default — re-running this exact test matrix (300-350 MiB, concurrency
+1-10) at the new default passes cleanly; see ``EVALUATION.md`` Finding 1 for
+the full root cause, the fix, and its residual risk (an upload larger than
+the configured buffer, delivered in sufficiently reversed order, can still
+hit the same wait). Gated behind ``OBJSTORAGE_TEST_REAL_AZURE_GATE=1`` for a
+manual run (reproduces against the default Azurite backend — you do not
+need real Azure credentials to see it) — but CI's own
+``live-conformance-azure`` job now sets this automatically on every PR,
+pinned to ``OBJSTORAGE_TEST_REAL_AZURE_SIZE_MIB=350``, as the standing
+regression guard for this exact fix.
 
 - A concurrency-latency check: 20 concurrent GETs must not show p99 latency
   scaling linearly with client count, which would reproduce a real,
   previously-shipped rclone bug (a lock held for an entire HTTP transaction,
   fixed in rclone 1.69). This one is **required, not skip-if-flaky**.
 
-Two tests are opt-in and excluded by default::
+One test stays opt-in and excluded even in CI::
 
     # Multipart server-side copy: rclone's own docs call this path
     # "unreliable and extremely slow, eventually failing" (issue #7454).
@@ -265,17 +277,19 @@ rendered settings; and the profile-image-bucket override's two behaviors
 Open edX's own local-filesystem default survives) both hold, confirmed by
 inspecting the actual rendered settings file before and after.
 
-Tier 5 — real Azure: does the already-confirmed hang also happen there?
+Tier 5 — real Azure: does the fix hold there too?
 --------------------------------------------------------------------------
 
-**The azure backend already failed Tier 4's adversarial multipart check,
-against Azurite, before Tier 5 was ever run — see EVALUATION.md Finding 1.**
-That alone is enough to not trust this backend with production course data;
-Tier 5 is not what tells you whether to trust it, Tier 4 already did. What
-Tier 5 *adds* is whether the hang is specifically about rclone's own request
-handling (reproduces identically against real Azure) or has an
-Azure-specific flavor. Either answer is worth recording; neither changes the
-Tier 4 result.
+**The azure backend's Tier 4 adversarial multipart check originally failed
+against Azurite at rclone's own 256MiB default buffer, then passed at every
+tested size/concurrency combination once `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`
+was raised to 2GiB — see EVALUATION.md Finding 1 for the root cause (an
+in-memory reorder buffer, confirmed by reading rclone's own source) and the
+full before/after test matrix.** Tier 5 is not what tells you whether to
+trust the fix; Tier 4 already did, against Azurite. What Tier 5 *adds* is
+whether the same fix holds against real Azure, or whether real Azure's own
+latency/throughput characteristics change where the threshold actually
+falls. Either answer is worth recording.
 
 1. Create a real Azure Storage account and override, together, in addition
    to the risk acknowledgment::
@@ -359,13 +373,15 @@ Known failure modes
    * - ``rclonegw`` is pinned near 100%+ CPU with no network I/O, and stops
        responding
      - azure
-     - The multipart hang — see ``EVALUATION.md`` Finding 1. (A second,
-       unrelated cause — a zero-duration ``--dir-cache-time`` causing a
-       directory-cache cleanup-timer storm, triggered by exporting any
-       course with a SCORM component — was found and fixed; see Finding 5.
-       If you're running a version of this plugin from before that fix, or
-       have manually overridden ``--dir-cache-time`` back to ``0``, you can
-       still hit it.)
+     - The multipart hang — a reversed-order upload larger than
+       ``OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`` (default 2GiB; raise it
+       if your course videos can exceed that) — see ``EVALUATION.md``
+       Finding 1. (A second, unrelated cause — a zero-duration
+       ``--dir-cache-time`` causing a directory-cache cleanup-timer storm,
+       triggered by exporting any course with a SCORM component — was found
+       and fixed; see Finding 5. If you're running a version of this plugin
+       from before that fix, or have manually overridden ``--dir-cache-time``
+       back to ``0``, you can still hit it.)
        ``tutor local restart rclonegw`` alone is often **not** enough: if the
        client that triggered it is still retrying (e.g. a stuck Celery
        task), it immediately re-triggers the hang against the freshly
