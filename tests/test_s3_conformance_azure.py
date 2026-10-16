@@ -42,11 +42,19 @@ pytestmark = pytest.mark.skipif(
     not ENDPOINT, reason="set OBJSTORAGE_TEST_ENDPOINT to run live S3 checks"
 )
 
-# Past the 256 MiB default --multipart-streaming-buffer-limit, and past
-# the ~322 MiB point a real user hit an unexplained multi-minute stall
-# uploading a 2 GiB file to `rclone serve s3` (rclone issue #7453,
-# root cause never conclusively pinned) — a token "just enough to force
-# multiple parts" size would not have caught that.
+# Past rclone's own 256 MiB default --multipart-streaming-buffer-limit
+# (this backend now raises it to OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT,
+# 2GiB by default - see EVALUATION.md Finding 1), and past the ~322 MiB
+# point a real user hit an unexplained multi-minute stall uploading a
+# 2 GiB file to `rclone serve s3` (rclone issue #7453, root cause never
+# conclusively pinned) — a token "just enough to force multiple parts"
+# size would not have caught that. This normally-ordered test doesn't need
+# to cross this backend's own (now much larger) buffer limit to be
+# meaningful: in-order parts admit immediately regardless of buffer
+# fullness (see Finding 1), so this is testing ordinary multipart delivery
+# at a realistic size, not the buffer boundary itself - the adversarial
+# out-of-order test below is what exercises that boundary, deliberately,
+# via OBJSTORAGE_TEST_REAL_AZURE_SIZE_MIB.
 MULTIPART_SIZE = 350 * 1024 * 1024
 # boto3's own default multipart chunk size. An artificially small part
 # size "just to force multiple parts" would not exercise the same

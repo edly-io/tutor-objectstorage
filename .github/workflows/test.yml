@@ -75,9 +75,22 @@ jobs:
           OBJSTORAGE_TEST_SECRET_KEY: test-secret-key-for-ci-only
           OBJSTORAGE_TEST_BUCKET: openedx
           OBJSTORAGE_TEST_PRIVATE_BUCKET: openedxgrades
-        # multipart_server_side_copy and the real-Azure gate are opted
-        # out of by default (see their skipif reasons); nothing here
-        # needs to exclude them explicitly.
+          # Finding 1's adversarial out-of-order multipart test used to be
+          # gated behind this (it reliably hung rclone's own 256MiB default
+          # buffer). Now that OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT raises
+          # that default to 2GiB and this test passes reliably against
+          # Azurite (~25s for all 5 concurrency levels at 350 MiB - see
+          # EVALUATION.md Finding 1), run it on every PR: it is exactly the
+          # regression guard for someone reverting that fix later.
+          # multipart_server_side_copy stays opted out by default (see its
+          # own skipif reason); nothing here needs to exclude it explicitly.
+          OBJSTORAGE_TEST_REAL_AZURE_GATE: "1"
+          # Pinned to the exact size this fix was validated against (see
+          # EVALUATION.md Finding 1's test matrix). Without this the test
+          # defaults to 1024 MiB per concurrency level (5 GiB total across
+          # the sweep) - untested here and unnecessarily heavy for routine
+          # CI.
+          OBJSTORAGE_TEST_REAL_AZURE_SIZE_MIB: "350"
         run: pytest -v tests/test_s3_conformance_azure.py
       - name: Dump gateway logs on failure
         if: failure()

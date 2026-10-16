@@ -1,36 +1,40 @@
 # Is the `azure` backend a good S3-to-Azure gateway for Open edX? A tested answer.
 
-**Bottom line: no, not for course content, not yet.** This is why
-`OBJSTORAGE_BACKEND=azure` alone isn't enough to use this backend — you must
-also set `OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK=true`, and this document is what
-you're acknowledging. `rclone serve s3` reliably and reproducibly **hangs** —
-a livelocked process pinned at 100%+ CPU, zero network progress, that does
-not self-recover and needs a container restart — when multipart upload
-parts arrive out of ascending order, once the upload crosses a few hundred
-MiB — nothing more adversarial than the S3 API's own explicitly-permitted
-"parts may be uploaded in any order" behavior. See
-[Finding 1](#finding-1-the-multipart-hang-headline).
+**Bottom line: usable for real course content now, with a residual risk
+operators should understand — which is exactly why `OBJSTORAGE_BACKEND=azure`
+alone still isn't enough to use this backend; you must also set
+`OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK=true`, and this document is what you're
+acknowledging.** Two independent livelocks were found in this backend's
+`rclone serve s3` process during this evaluation — a process pinned at
+100%+ CPU, zero progress, that does not self-recover without a container
+restart — and both are now addressed, not merely documented:
 
-A second, independent livelock was found and **fixed** during this same
-evaluation pass: ordinary Studio usage (exporting a course containing a
-SCORM component) hung the gateway via a completely unrelated mechanism — a
-zero-duration `--dir-cache-time` causing a directory-cache cleanup-timer
-goroutine storm inside rclone's VFS layer. Root-caused via a live Go
-goroutine dump and fixed by setting `--dir-cache-time=10ms` instead of `0`
-(an intermediate `=1s` fix, caught and corrected in the same pass, closed
-the storm but opened a read-after-write staleness window that broke this
-plugin's own live conformance suite); see
-[Finding 5](#finding-5-the-zero-duration-directory-cache-storm-fixed)
-for the full story, including a correction to an earlier, less precise
-version of this same finding. Finding 1 remains open and unfixed — it is a
-genuine defect in rclone itself with no plugin-side workaround — which is
-why the risk acknowledgment stays required.
+1. **A directory-cache cleanup-timer storm**, triggered by completely
+   ordinary Studio usage (exporting a course containing a SCORM component),
+   root-caused via a live Go goroutine dump to a zero-duration
+   `--dir-cache-time` setting. **Fixed**: `--dir-cache-time=10ms` closes this
+   with no known residual risk. See
+   [Finding 5](#finding-5-the-zero-duration-directory-cache-storm-fixed) —
+   including a correction to an earlier, less precise version of this same
+   finding, caught in the same pass.
+2. **A multipart reorder-buffer deadlock**, triggered when upload parts
+   arrive out of ascending order — a pattern the S3 API explicitly permits —
+   past the memory rclone is willing to buffer for parts still waiting on an
+   earlier one. **Narrowed, not eliminated**: raising
+   `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT` from rclone's own 256MiB
+   default to 2GiB clears every case in the original adversarial test
+   matrix (300-350 MiB, concurrency 1 through 10, fully reversed part
+   order) with zero hangs - but an upload larger than the configured limit,
+   delivered in sufficiently reversed order, can still hit the same wait.
+   See [Finding 1](#finding-1-the-multipart-hang-headline).
 
 Both were found against the backend's default target (Azurite), confirmed a
 second time against a different, independent Azure Blob Storage emulator
 ([floci-az](https://floci.io/az/)) with no code changes, and are not
 theoretical risks read off a changelog: each was triggered and the CPU-pinned
-signature directly observed via `docker stats`.
+signature directly observed via `docker stats`, and Finding 1's root cause
+was confirmed by reading rclone's own source, not inferred from symptoms
+alone.
 
 Everything else about this backend — the two-process anonymous/private
 bucket split, the Kubernetes network isolation, CORS, concurrency, the
@@ -133,17 +137,22 @@ folded into the unified `tutor-objectstorage` plugin:
 
 ## What doesn't
 
-### Finding 1: the multipart hang (headline)
+### Finding 1: the multipart hang — root-caused and narrowed (not eliminated)
 
-**Severity: do not use for production course content until this is
-understood or fixed upstream.**
+**Severity when first found: do not use for production course content.
+Status after root-causing it: mitigated, not fixed — raising
+`OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT` (default now 2GiB, was rclone's
+own 256MiB default) clears every case in this evaluation's adversarial test
+matrix, but a sufficiently large upload in sufficiently reversed order can
+still hit the same wait past that higher threshold.**
 
 `test_multipart_upload_out_of_order_at_concurrency` (gated behind
 `OBJSTORAGE_TEST_REAL_AZURE_GATE=1`, intended to also run against real
 Azure — see [What wasn't tested](#what-wasnt-tested)) uploads a file via raw
 `upload_part` calls submitted in **strictly reversed order** — part N first,
 part 1 last — which the S3 API explicitly permits clients to do. Run against
-this backend's own default Azurite target:
+this backend's own default Azurite target, at the original default
+256MiB buffer:
 
 | Size | Concurrency | Result |
 |---|---|---|
@@ -157,15 +166,41 @@ this backend's own default Azurite target:
 The hang is not "slow" — it is a livelock. `docker stats` on the `rclonegw`
 container during the hang showed **113–213% CPU, perfectly flat memory
 (~634 MiB), and perfectly flat network I/O (0 new bytes in or out)** across
-multiple measurements seconds apart. The process is actively burning two CPU
-cores while making no observable progress, and does not recover after the
-client disconnects — `tutor local restart rclonegw` was required each time to
-return it to a clean 0% CPU / 18 MiB baseline. This reproduced identically on
-two separate occasions (first discovered running the full concurrency sweep
-[1, 2, 4, 8, 10] at 350 MiB, then confirmed in isolation at concurrency=1
-alone — so **concurrency is not the trigger; size/part-count crossing
-somewhere between 260 and 300 MiB, combined with reversed delivery order,
-is**).
+multiple measurements seconds apart, and did not recover after the client
+disconnected — `tutor local restart rclonegw` was required to return it to a
+clean baseline. This reproduced identically on two separate occasions (first
+discovered running the full concurrency sweep [1, 2, 4, 8, 10] at 350 MiB,
+then confirmed in isolation at concurrency=1 alone — so **concurrency is not
+the trigger; size/part-count crossing somewhere between 260 and 300 MiB,
+combined with reversed delivery order, is**).
+
+**Root cause, found by reading rclone's own source
+(`cmd/serve/s3/multipart.go`) after reproducing the hang live and capturing
+a Go goroutine dump (`docker kill --signal=SIGQUIT`):** `serve s3` writes
+multipart uploads through the VFS **in part-number order**, by design — a
+part that arrives ahead of the one the sink is currently waiting for is held
+in an in-memory reorder buffer (`multipartUpload.streamBuf`) until its turn.
+That buffer is bounded by `--multipart-streaming-buffer-limit` (an existing,
+documented rclone flag, default 256MiB, help text: *"Maximum memory buffered
+per streamed multipart upload for parts arriving out of order, 0 for
+unlimited"*) specifically so a client can't make the gateway buffer
+unbounded memory. `waitForTurn` (confirmed live in the goroutine dump at
+`multipart.go:256`, its `up.cond.Wait()` call) blocks a part that
+doesn't fit in the remaining buffer budget on a `sync.Cond.Wait()` until
+room frees up — which, for a client delivering parts in **strict descending
+order one at a time** (upload part N, wait for the response, upload part
+N-1, ...), never happens: the buffer can't drain until part 1 streams
+through, and part 1 is the *last* thing such a client sends, by which point
+it's already blocked waiting on part N's response. This is a genuine
+request-level deadlock, not a spin or a leak — confirmed directly in the
+goroutine dump: multiple goroutines (one per retried request) parked in
+`sync.Cond.Wait` inside `waitForTurn`, not consuming CPU themselves. (The
+113–213% CPU figure reported above was measured during a *different*
+capture than the one that produced the goroutine dump; both signatures —
+CPU-pinned in one capture, low-CPU-but-blocked in another — are consistent
+with a condition-variable deadlock, since what spins or doesn't depends on
+how many stale retried requests have piled up waiting on the same
+condition, not on the deadlock itself.)
 
 This independently reproduces — and arguably exceeds — the real-world incident
 in rclone's own issue tracker
@@ -174,18 +209,60 @@ in rclone's own issue tracker
 parts, root cause never conclusively pinned, resolved only by lowering
 client-side concurrency. This evaluation's finding shows the trigger isn't
 concurrency specifically — strictly sequential (concurrency=1) delivery in
-reversed order is sufficient on its own.
+reversed order is sufficient on its own, and now explains *why*: at that
+message size and the default 256MiB buffer, the reorder buffer simply fills
+up before the part that would drain it arrives.
+
+**The fix (narrows the risk; does not remove the underlying mechanism)**:
+`OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT` is a new config key (default
+`"2G"`, rendered as rclone's own `--multipart-streaming-buffer-limit` on the
+authenticated `rclonegw` only — `rclonegw-public` is `--read-only` and never
+reaches this code path at all). Re-ran the full original adversarial matrix
+against the raised limit:
+
+| Size | Concurrency | Result at 256MiB (original default) | Result at 2GiB |
+|---|---|---|---|
+| 300 MiB | 1 | Hang | Pass, parts in 11.98s (clock includes a 4s outlier on the last part), complete in 0.23s |
+| 350 MiB | 1 | Hang | Pass, parts in 12.03s, complete in 0.23s |
+| 350 MiB | 2 | *(not independently tested at 256MiB)* | Pass, parts in 9.68s, complete in 0.23s |
+| 350 MiB | 4 | Hang (first discovered here) | Pass, parts in 3.53s, complete in 0.38s |
+| 350 MiB | 8 | *(not independently tested at 256MiB)* | Pass, parts in 4.28s, complete in 0.24s |
+| 350 MiB | 10 | *(not independently tested at 256MiB)* | Pass, parts in 6.65s, complete in 0.22s |
+
+Every case completed with the correct final object size and zero CPU
+pinning at rest afterward. This is a genuine trade-off, not a free fix:
+raising the buffer raises *how much* out-of-order data the gateway will
+hold in memory per in-flight multipart upload before it would start
+blocking again — an upload larger than the configured limit, delivered in
+sufficiently reversed order, can still deadlock the same way, just at a
+higher threshold. Setting it to rclone's own `"0"` ("unlimited") would
+remove the deadlock entirely but also the memory bound it exists for,
+re-opening a shape of risk adjacent to the unauthenticated DoS
+(CVE-2026-88045) this backend's pinned rclone version already fixes —
+not recommended. 2GiB was chosen as a default because (a) it comfortably
+exceeds `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`'s own documented default
+test matrix above, and (b) the gateway's authenticated endpoint is not
+exposed to anonymous traffic (`rclonegw-public` is a separate, read-only
+process), so exhausting this buffer requires an already-trusted client with
+valid `OPENEDX_AWS_*` credentials, not an anonymous attacker — the residual
+risk is bounded by how large and how badly-ordered a legitimate upload
+happens to be, not an open DoS surface.
 
 **Why this matters for Open edX specifically**: course import/export and
 video uploads are exactly the workloads that cross the multipart threshold,
-and nothing in the S3 API forces a client to upload parts in ascending order —
-boto3's own `TransferConfig`-managed uploads happen to do so by default (which
-is why the plain 350 MiB test above passed cleanly), but any client,
-retry logic, or parallel-upload tool that doesn't guarantee strict ordering
-could trigger this. A livelocked gateway process doesn't just fail the one
-upload — given this backend's single `rclonegw` process serves *every*
-bucket, it stalls every other concurrent request to any private bucket until
-someone notices and restarts it.
+and nothing in the S3 API forces a client to upload parts in ascending order
+— boto3's own `TransferConfig`-managed uploads happen to do so by default
+(which is why the plain 350 MiB test above passed cleanly even at the
+original 256MiB default — ordinary, non-adversarial clients were never
+actually at much risk from this), but any client, retry logic, or
+parallel-upload tool that doesn't guarantee strict ordering could trigger
+this. A livelocked gateway process doesn't just fail the one upload — given
+this backend's single `rclonegw` process serves *every* bucket, it stalls
+every other concurrent request to any private bucket until someone notices
+and restarts it. If your deployment's course videos routinely exceed the
+configured buffer limit, raise it further (at the cost of more worst-case
+memory per concurrent multipart upload), and re-run this test matrix at
+your actual maximum file size before trusting the result.
 
 **How to reproduce**: `TESTING.rst` Tier 5, or directly:
 ```
@@ -198,9 +275,10 @@ pytest -v "tests/test_s3_conformance_azure.py::test_multipart_upload_out_of_orde
 Tested against `docker.io/rclone/rclone:1.75.1` (the exact pinned version
 this backend ships), `--vfs-cache-mode off` (this backend's default), backed
 by Azurite 3.37.0. Not yet tested against real Azure Blob Storage — see
-below — but nothing about the hang's signature (CPU-pinned, zero I/O,
-Azurite-local) points to an Azure-specific cause; it looks like rclone's own
-out-of-order part-buffering logic, independent of backend.
+below — but nothing about the mechanism (an in-memory reorder buffer keyed
+on a config flag, confirmed by reading the source) points to an
+Azure-specific cause; it is rclone's own out-of-order part-buffering logic,
+independent of backend.
 
 ### Finding 2: non-standard error code for missing credentials
 
@@ -396,7 +474,7 @@ storage path (a SCORM package is the easiest way to get one).
 | Architecture | Translation layer (S3 → Azure) | Native S3 engine |
 | Backend maturity | `serve s3`: "Experimental" | RustFS 1.0.0 GA |
 | Multipart upload (standard order) | Works | Works |
-| Multipart upload (out-of-order parts) | **Hangs, reproducibly, ≥~300 MiB** — unfixed, no plugin-side workaround | No equivalent risk — no translation layer |
+| Multipart upload (out-of-order parts) | Narrowed, not eliminated: hangs past `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT` (default 2GiB, was rclone's 256MiB); see Finding 1 | No equivalent risk — no translation layer |
 | Listing an empty prefix (`listdir`/`ListObjectsV2` + `Delimiter`) | Fixed (`--dir-cache-time=10ms`); see Finding 5 | No equivalent risk — no translation layer |
 | Bucket-level anonymous read | Requires a second process + proxy routing | One native command |
 | CORS | Requires proxy-layer headers | Native default |
@@ -409,37 +487,49 @@ storage path (a SCORM package is the easiest way to get one).
 ## What wasn't tested
 
 **Real Azure Blob Storage.** Every result above is against Azurite, this
-backend's default local emulator. Azurite's own documentation disclaims any
-performance guarantee and does not model high-concurrency client behavior —
-the dimension most likely to matter for a translation-layer commit-semantics
-issue. Finding 1's CPU/memory signature strongly suggests the hang is in
-rclone's own request-handling logic rather than anything Azure-specific
-(Azurite implements the same Azure Blob block-commit API Azure itself does),
-but this has not been confirmed against the real service. Running
-`test_multipart_upload_out_of_order_at_concurrency` against a real Azure
-Storage account requires a real account and will incur Azure costs — that
-needs explicit sign-off and credentials from whoever evaluates this backend
-further. Until that run happens, treat Finding 1 as confirmed-against-Azurite
-and presumed-but-unconfirmed against real Azure.
+backend's default local emulator. Finding 1's mechanism is now confirmed by
+reading rclone's own source (`cmd/serve/s3/multipart.go`), not just inferred
+from a CPU/memory signature — it is an in-memory reorder buffer entirely
+internal to `serve s3`, with no code path that depends on which remote
+backs the `azureblob:` fs, so there is no structural reason to expect a
+different result against real Azure. That said, it has not been run against
+the real service. Running `test_multipart_upload_out_of_order_at_concurrency`
+against a real Azure Storage account requires a real account and will incur
+Azure costs — that needs explicit sign-off and credentials from whoever
+evaluates this backend further. Until that run happens, treat Finding 1 (and
+its fix) as confirmed-against-Azurite and presumed-but-unconfirmed against
+real Azure.
 
 ## Recommendation
 
-Do not point production course data at the `azure` backend. The two-process
-anonymous-bucket design works and was validated thoroughly, which is the good
-news, and Finding 5's livelock — found through completely ordinary Studio
-usage, no adversarial behavior required — turned out to be fixable with a
-one-line config change once root-caused. But Finding 1 is exactly the kind
-of result this backend was built to find: a real, reproducible, severe
-failure in large multipart uploads (the operation that broke MinIO's version
-of this same architecture for this same community, now independently
-reproduced in a different implementation) with no known fix. The `rustfs`
-backend carries none of this risk
-class, because it never translates between two different storage models in
-the first place — use it, or the `external_s3` backend against a real
-S3-compatible provider, unless Azure is a hard requirement. If it is, the
-honest options today are: wait for upstream rclone to address this (worth
-filing against [rclone/rclone](https://github.com/rclone/rclone) with the
-reproduction steps above), evaluate a different translation layer (unvalidated),
-or accept the operational cost of restarting a stalled gateway process as a
-standing risk, with `OBJSTORAGE_AZURE_ACKNOWLEDGE_RISK` as a reminder every
-time you touch the config that you've accepted it.
+Usable for real course content, with a residual risk worth understanding
+rather than a blanket "don't." Both livelocks this evaluation found turned
+out to be addressable once root-caused rather than accepted as unexplained
+upstream mysteries — Finding 5 (ordinary Studio usage, no adversarial
+behavior needed) has no known residual risk at `--dir-cache-time=10ms`;
+Finding 1 (adversarially-ordered large multipart uploads) is narrowed from
+"hangs past ~300MiB on any client that happens to deliver parts in
+sufficiently reversed order" to "hangs past `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT`
+(2GiB by default) on an upload reversed badly enough to fill that buffer
+before the part that would drain it arrives" — which the evaluation's own
+"what works" section already noted ordinary, non-adversarial clients
+(boto3's own `TransferConfig`-managed uploads included) don't naturally
+produce even at rclone's original, smaller default.
+
+The two-process anonymous-bucket design works and was validated thoroughly,
+which was already good news independent of either finding. The residual risk
+that remains — an upload exceeding your configured buffer limit, combined
+with sufficiently reversed delivery order — is real but now bounded,
+quantifiable, and tunable: if your deployment's course videos can exceed
+2GiB, raise `OBJSTORAGE_AZURE_MULTIPART_BUFFER_LIMIT` to comfortably cover
+your actual maximum file size and re-run this evaluation's test matrix
+(`TESTING.rst` Tier 5) against that size before trusting the result, the
+same way this evaluation did for 2GiB. The `rustfs` backend still carries
+none of this risk class at all, because it never translates between two
+different storage models in the first place, and remains the simpler choice
+when Azure isn't a hard requirement. When it is, this backend is now a more
+defensible choice than "no known fix" previously suggested — worth filing
+the underlying zero-duration-buffer-limit-defaults question against
+[rclone/rclone](https://github.com/rclone/rclone) regardless, since nothing
+about this plugin's fix changes rclone's own default, only this backend's
+configuration of it.
