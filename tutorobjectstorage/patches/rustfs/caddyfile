@@ -9,8 +9,28 @@
     # port: 9001 serves the S3 API at "/" and mounts the console under
     # "/rustfs/console/", so proxying "/" straight through lands
     # visitors on an S3 "AccessDenied" XML document. Redirect the bare
-    # host to the console path; everything else proxies unchanged.
-    redir / /rustfs/console/ 302
+    # host to the console path - but only for a plain browser visit.
+    #
+    # The console's own frontend also talks straight to "/" for its
+    # signed STS/S3 calls (POST / for the login handshake, GET
+    # /?x-id=ListBuckets for the dashboard) - an unconditional redirect
+    # here intercepts those too, breaking the signature (the browser
+    # follows the redirect still carrying the original signature, which
+    # no longer matches the path RustFS actually receives) and surfacing
+    # as a confusing `SignatureDoesNotMatch: missing signed header:
+    # content-type` instead of a login failure. Confirmed live: a plain
+    # `curl -X POST /` with an Authorization header got redirected here
+    # before this fix, exactly like a human's browser would. Scope the
+    # redirect to requests with neither an Authorization header nor a
+    # presigned `X-Amz-Signature` query parameter, so only a genuine bare
+    # GET / - never a signed request - gets sent to the console path.
+    @plain_root {
+        path /
+        method GET
+        not header Authorization *
+        not query X-Amz-Signature=*
+    }
+    redir @plain_root /rustfs/console/ 302
     import proxy "rustfs:9001"
 }
 {% endif %}

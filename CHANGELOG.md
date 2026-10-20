@@ -4,6 +4,28 @@
 
 ## Unreleased
 
+- [Bugfix] The `rustfs` backend's console login failed with
+  `SignatureDoesNotMatch: missing signed header: content-type`, which
+  looked like a credentials problem but wasn't one - found live, debugging
+  a real login attempt. RustFS's own console frontend sends signed
+  STS/S3 calls straight to the bare root (`POST /` for the login
+  handshake, `GET /?x-id=ListBuckets` for the dashboard), and the
+  Caddyfile's `redir / /rustfs/console/ 302` - meant only for a human
+  navigating to the bare host - intercepted those too, unconditionally:
+  confirmed live with `curl -X POST /` and a (deliberately invalid)
+  `Authorization` header, which got redirected exactly like a plain
+  browser visit instead of reaching RustFS. The browser then followed
+  that redirect still carrying the original signature, which no longer
+  matched the path RustFS actually received, surfacing as a signature
+  error instead of a routing one. Fixed by scoping the redirect to a
+  Caddy matcher that excludes requests carrying an `Authorization` header
+  or a presigned `X-Amz-Signature` query parameter - verified live that
+  signed requests now reach RustFS directly (getting RustFS's own, correct
+  403/400 for an invalid signature) while a plain `GET /` still redirects
+  to the console as before. New regression test in `test_patches.py`
+  confirmed red against the old unconditional redirect before being
+  restored to green against the fix.
+
 - [Bugfix] `EVALUATION.md` Finding 1 (the out-of-order multipart hang,
   documented since this plugin's initial release as "do not use for
   production course content until this is understood or fixed upstream")

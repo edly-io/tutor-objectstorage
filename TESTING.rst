@@ -333,6 +333,17 @@ Known failure modes
    * - ``SignatureDoesNotMatch``
      - any
      - Access key or secret differs between the backend and Open edX.
+   * - RustFS console login fails with ``SignatureDoesNotMatch: missing
+       signed header: content-type``, credentials otherwise confirmed
+       correct
+     - rustfs
+     - Not a credentials problem - the console's own frontend sends
+       signed STS/S3 calls straight to the bare root (``POST /`` for
+       login, ``GET /?x-id=ListBuckets`` for the dashboard). Fixed by
+       scoping the Caddyfile's console redirect to unsigned requests
+       only; if you're on a version from before that fix, confirm with
+       ``curl -X POST http://<console host>/`` - a ``302`` there (instead
+       of a response from RustFS itself) is the signature.
    * - Uploads fail with a checksum error
      - any
      - The ``request_checksum_calculation`` setting was removed from

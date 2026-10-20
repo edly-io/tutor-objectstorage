@@ -272,6 +272,42 @@ def test_rustfs_init_script_never_sets_anonymous_public() -> None:
     assert "anonymous set download" in script
 
 
+# --- the console-login redirect must not intercept signed requests ----------
+# RustFS's own console frontend talks straight to the bare root for its
+# signed STS/S3 calls (POST / for the login handshake, GET
+# /?x-id=ListBuckets for the dashboard) - confirmed live against a real
+# running stack. An earlier version of this patch redirected literally
+# every request to "/" (signed or not) to /rustfs/console/, which broke
+# those signed calls (the browser follows the redirect still carrying the
+# original signature, which no longer matches the path RustFS actually
+# receives) and surfaced as `SignatureDoesNotMatch: missing signed header:
+# content-type` instead of a login failure - not a credentials problem,
+# a routing one.
+def test_rustfs_console_redirect_does_not_intercept_signed_requests(
+    base_config: dict[str, t.Any],
+) -> None:
+    from tests.conftest import render_for_backend
+
+    cfg = render_for_backend(base_config, "rustfs")
+    caddy = tutor_env.Renderer(cfg).patch("caddyfile")
+
+    assert "redir / /rustfs/console/" not in caddy, (
+        "an unconditional `redir /` also redirects the console's own "
+        "signed STS/S3 calls to the bare root, breaking login"
+    )
+    assert re.search(r"redir\s+@\w+\s+/rustfs/console/\s+302", caddy), (
+        "expected the redirect to use a named matcher, not a bare path"
+    )
+    assert "not header Authorization *" in caddy, (
+        "the matcher must exclude header-signed requests (e.g. the "
+        "console's own STS login POST /)"
+    )
+    assert "not query X-Amz-Signature=*" in caddy, (
+        "the matcher must exclude presigned/query-signed requests (e.g. "
+        "the console's own GET /?x-id=ListBuckets)"
+    )
+
+
 # --- hook-name validity ------------------------------------------------------
 # Confirmed load-bearing by tutor-rclone-gateway's own development history:
 # this is the test that would have caught `k8s-networkpolicy` (a
